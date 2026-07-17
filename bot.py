@@ -139,8 +139,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-durum nedir
-
-
-
-anlamadım
