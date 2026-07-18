@@ -9,15 +9,18 @@ from pathlib import Path
 
 import feedparser
 import requests
+import trafilatura
 
 BASE_DIR = Path(__file__).resolve().parent
 SEEN_FILE = BASE_DIR / "seen.json"
 MAX_SEEN_KEPT = 1500
 MAX_POSTS_PER_RUN = 12
 MAX_POSTS_PER_FEED = 2
-SUMMARY_MAX_LEN = 280
-CAPTION_SUMMARY_MAX_LEN = 180  # Telegram photo captions are capped at 1024 chars
+SUMMARY_MAX_LEN = 800
+CAPTION_SUMMARY_MAX_LEN = 650  # Telegram photo captions are capped at 1024 chars total
 DELAY_BETWEEN_POSTS = 4  # seconds, stays well under Telegram's rate limits
+ARTICLE_FETCH_TIMEOUT = 10
+ARTICLE_FETCH_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 CHANNEL = "@gundem360haber"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -95,16 +98,104 @@ def find_image(entry) -> str | None:
     return None
 
 
-def build_message(source_name: str, entry, summary_max_len: int = SUMMARY_MAX_LEN) -> str:
-    raw_title = strip_html(entry.get("title", ""))
-    raw_summary = strip_html(entry.get("summary", "") or entry.get("description", ""))
+def fetch_full_text(url: str) -> str | None:
+    if not url:
+        return None
+    try:
+        resp = requests.get(url, timeout=ARTICLE_FETCH_TIMEOUT, headers=ARTICLE_FETCH_HEADERS)
+        resp.raise_for_status()
+        return trafilatura.extract(resp.text, url=url, include_comments=False, include_tables=False)
+    except Exception as exc:
+        print(f"Tam metin alinamadi ({url}): {exc}", file=sys.stderr)
+        return None
 
-    summary = raw_summary
-    if len(summary) > summary_max_len:
-        summary = summary[:summary_max_len].rsplit(" ", 1)[0] + "..."
+
+TR_MONTHS = "Ocak|Şubat|Mart|Nisan|Mayıs|Haziran|Temmuz|Ağustos|Eylül|Ekim|Kasım|Aralık"
+DATE_LINE_RE = re.compile(
+    rf"\d{{1,2}}\s+(?:{TR_MONTHS})\s+\d{{4}}(\s*G[uü]ncelleme:\s*\d{{1,2}}\s+(?:{TR_MONTHS})\s+\d{{4}})?",
+    re.IGNORECASE,
+)
+NUMERIC_DATE_RE = re.compile(r"\d{1,2}\.\d{1,2}\.\d{4}(\s+\d{1,2}:\d{2})?")
+UPDATE_LABEL_RE = re.compile(r"(Son\s+)?G[uü]ncelleme(\s*Tarihi)?\s*:?", re.IGNORECASE)
+SOCIAL_NOISE_LINE_RE = re.compile(
+    r"^(#\S+"
+    r"|[—-]\s*.+\(@\w+\).*"
+    r"|(B[uü]y[uü]kl[uü]k|Yer|Tarih|Saat|Enlem|Boylam|Derinlik|Detay)\s*:.*"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def strip_boilerplate(text: str, title: str = "") -> str:
+    text = UPDATE_LABEL_RE.sub("", text)
+    text = DATE_LINE_RE.sub("", text)
+    text = NUMERIC_DATE_RE.sub("", text)
+
+    title_norm = title.strip().casefold()
+    lines = [
+        line.strip()
+        for line in text.split("\n")
+        if line.strip() and not SOCIAL_NOISE_LINE_RE.match(line.strip())
+    ]
+    while lines:
+        first = lines[0]
+        first_norm = first.casefold()
+        is_title_dup = title_norm and (
+            first_norm == title_norm or (len(title_norm) > 20 and first_norm.startswith(title_norm[:40]))
+        )
+        if is_title_dup:
+            lines.pop(0)
+            continue
+        looks_like_prose = len(first) > 80 or re.search(r"[.!?]", first)
+        if looks_like_prose:
+            break
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def clean_rss_teaser(entry) -> str:
+    raw = strip_html(entry.get("summary", "") or entry.get("description", ""))
+    raw = re.sub(r"devam\w*\s+i[cç]in\s+t[ıi]klay[ıi]n[ıi]z\.?", "", raw, flags=re.IGNORECASE)
+    return raw.strip()
+
+
+def get_body_text(entry) -> str:
+    full_text = fetch_full_text(entry.get("link", ""))
+    if full_text:
+        full_text = strip_boilerplate(full_text, title=strip_html(entry.get("title", "")))
+        if len(full_text) > 40:
+            return full_text
+    return clean_rss_teaser(entry)
+
+
+def clean_excerpt(text: str, max_len: int) -> str:
+    text = (text or "").strip()
+    if not text or len(text) <= max_len:
+        return text
+
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    picked = []
+    total = 0
+    for sentence in sentences:
+        if picked and total + len(sentence) + 1 > max_len:
+            break
+        picked.append(sentence)
+        total += len(sentence) + 1
+
+    excerpt = " ".join(picked).strip()
+    if not excerpt:
+        excerpt = text[:max_len].rsplit(" ", 1)[0].strip()
+    if len(excerpt) < len(text):
+        excerpt = excerpt.rstrip(".") + "..."
+    return excerpt
+
+
+def build_message(source_name: str, entry, body_text: str, summary_max_len: int = SUMMARY_MAX_LEN) -> str:
+    raw_title = strip_html(entry.get("title", ""))
+    summary = clean_excerpt(body_text, summary_max_len)
 
     parts = []
-    if is_breaking(raw_title, raw_summary):
+    if is_breaking(raw_title, body_text[:300]):
         parts.append("🚨 <b>SON DAKİKA</b> 🚨")
     parts.append(f"<b>{html.escape(raw_title)}</b>")
     if summary:
@@ -157,13 +248,14 @@ def send_photo_to_telegram(image_url: str, caption: str) -> bool:
 
 
 def post_entry(source_name: str, entry) -> bool:
+    body_text = get_body_text(entry)
     image_url = find_image(entry)
     if image_url:
-        caption = build_message(source_name, entry, summary_max_len=CAPTION_SUMMARY_MAX_LEN)
+        caption = build_message(source_name, entry, body_text, summary_max_len=CAPTION_SUMMARY_MAX_LEN)
         if send_photo_to_telegram(image_url, caption):
             return True
         # Image failed to send (bad url, hotlink block, wrong format) - fall back to text.
-    return send_to_telegram(build_message(source_name, entry))
+    return send_to_telegram(build_message(source_name, entry, body_text, summary_max_len=SUMMARY_MAX_LEN))
 
 
 def main():

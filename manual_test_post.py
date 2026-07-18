@@ -8,8 +8,8 @@ import feedparser
 
 import bot
 
-TARGET_TOTAL = 3
-MAX_PER_SOURCE = 2
+TARGET_TOTAL = 2
+MAX_PER_SOURCE = 1
 
 
 def main():
