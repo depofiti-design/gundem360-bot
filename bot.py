@@ -34,8 +34,6 @@ SOURCES = [
     ("Milliyet", "https://www.milliyet.com.tr/rss/rssnew/gundemrss.xml"),
     ("CNN Turk", "https://www.cnnturk.com/feed/rss/all/news"),
     ("BBC Turkce", "https://feeds.bbci.co.uk/turkce/rss.xml"),
-    ("BBC World", "http://feeds.bbci.co.uk/news/world/rss.xml"),
-    ("Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml"),
 ]
 
 BREAKING_KEYWORDS = [
