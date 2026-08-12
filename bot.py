@@ -203,46 +203,47 @@ def build_message(source_name: str, entry, body_text: str, summary_max_len: int 
     return "\n\n".join(parts)
 
 
-def send_to_telegram(text: str) -> bool:
+TELEGRAM_RETRIES = 3
+TELEGRAM_RETRY_DELAY = 5  # seconds
+
+
+def telegram_post(method: str, data: dict, timeout: int) -> bool:
     if not BOT_TOKEN:
         print("HATA: TELEGRAM_BOT_TOKEN ortam degiskeni bulunamadi.", file=sys.stderr)
         return False
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    resp = requests.post(
-        url,
-        data={
-            "chat_id": CHANNEL,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=15,
-    )
-    if resp.status_code != 200:
-        print(f"Telegram hatasi ({resp.status_code}): {resp.text}", file=sys.stderr)
-        return False
-    return True
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    for attempt in range(1, TELEGRAM_RETRIES + 1):
+        try:
+            resp = requests.post(url, data=data, timeout=timeout)
+        except requests.exceptions.RequestException as exc:
+            print(f"Telegram istegi basarisiz (deneme {attempt}/{TELEGRAM_RETRIES}): {exc}", file=sys.stderr)
+        else:
+            if resp.status_code == 200:
+                return True
+            print(f"Telegram hatasi ({resp.status_code}, deneme {attempt}/{TELEGRAM_RETRIES}): {resp.text}", file=sys.stderr)
+            if resp.status_code < 500 and resp.status_code != 429:
+                return False  # client-side error (bad request etc.) - retrying won't help
+        if attempt < TELEGRAM_RETRIES:
+            time.sleep(TELEGRAM_RETRY_DELAY)
+    return False
+
+
+def send_to_telegram(text: str) -> bool:
+    return telegram_post("sendMessage", {
+        "chat_id": CHANNEL,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }, timeout=15)
 
 
 def send_photo_to_telegram(image_url: str, caption: str) -> bool:
-    if not BOT_TOKEN:
-        print("HATA: TELEGRAM_BOT_TOKEN ortam degiskeni bulunamadi.", file=sys.stderr)
-        return False
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    resp = requests.post(
-        url,
-        data={
-            "chat_id": CHANNEL,
-            "photo": image_url,
-            "caption": caption,
-            "parse_mode": "HTML",
-        },
-        timeout=20,
-    )
-    if resp.status_code != 200:
-        print(f"Telegram foto hatasi ({resp.status_code}): {resp.text}", file=sys.stderr)
-        return False
-    return True
+    return telegram_post("sendPhoto", {
+        "chat_id": CHANNEL,
+        "photo": image_url,
+        "caption": caption,
+        "parse_mode": "HTML",
+    }, timeout=20)
 
 
 def post_entry(source_name: str, entry) -> bool:
@@ -288,7 +289,13 @@ def main():
             if new_from_feed >= MAX_POSTS_PER_FEED or posted >= MAX_POSTS_PER_RUN:
                 break
 
-            if post_entry(source_name, entry):
+            try:
+                sent = post_entry(source_name, entry)
+            except Exception as exc:  # a single bad entry shouldn't kill the whole run
+                print(f"Haber gonderilemedi ({source_name}): {exc}", file=sys.stderr)
+                sent = False
+
+            if sent:
                 seen.add(eid)
                 seen_order.append(eid)
                 posted += 1
