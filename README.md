@@ -2,11 +2,11 @@
 
 `@gundem360haber` Telegram kanalina, ücretsiz RSS kaynaklarindan derlenen haberleri
 otomatik olarak gönderen bot. GitHub Actions üzerinde çalışır, bu yüzden bilgisayar
-kapalıyken de her 30 dakikada bir kendiliğinden çalışmaya devam eder.
+kapalıyken de her saat başı kendiliğinden çalışmaya devam eder.
 
 ## Nasıl çalışır
 
-- `.github/workflows/post.yml` her 30 dakikada bir `bot.py` dosyasını çalıştırır.
+- `.github/workflows/post.yml` saatte bir `bot.py` dosyasını çalıştırır.
 - `bot.py`, `SOURCES` listesindeki RSS kaynaklarını okur, daha önce paylaşılmamış
   haberleri bulur ve kanala gönderir.
 - Her haber şu formatta paylaşılır: başlık, kısa özet, `Kaynak: <site adı>` ve
@@ -24,8 +24,10 @@ ekleyip repo'ya push etmek yeterli.
 
 ## Sıklığı değiştirmek
 
-`.github/workflows/post.yml` içindeki `cron: "*/30 * * * *"` satırını
-değiştirin (ör. her 15 dakikada bir için `*/15 * * * *`).
+`.github/workflows/post.yml` içindeki `cron: "0 * * * *"` satırını
+değiştirin (ör. her 15 dakikada bir için `*/15 * * * *`). Not: GitHub'ın
+ücretsiz planında aylık 2000 dakika Actions kotası var, çok sık çalıştırmak
+bu kotayı hızla tüketip botu durdurabilir.
 
 ## Gizli bilgiler
 
