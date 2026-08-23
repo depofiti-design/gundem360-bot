@@ -11,6 +11,8 @@ import feedparser
 import requests
 import trafilatura
 
+from card import categorize, generate_card
+
 BASE_DIR = Path(__file__).resolve().parent
 SEEN_FILE = BASE_DIR / "seen.json"
 MAX_SEEN_KEPT = 1500
@@ -21,6 +23,7 @@ CAPTION_SUMMARY_MAX_LEN = 650  # Telegram photo captions are capped at 1024 char
 DELAY_BETWEEN_POSTS = 4  # seconds, stays well under Telegram's rate limits
 ARTICLE_FETCH_TIMEOUT = 10
 ARTICLE_FETCH_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+CARD_POST_CHANCE = 0.05  # non-breaking odds of using the graphic card style instead of a plain photo post
 
 CHANNEL = "@gundem360haber"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -207,14 +210,14 @@ TELEGRAM_RETRIES = 3
 TELEGRAM_RETRY_DELAY = 5  # seconds
 
 
-def telegram_post(method: str, data: dict, timeout: int) -> bool:
+def telegram_post(method: str, data: dict, timeout: int, files: dict | None = None) -> bool:
     if not BOT_TOKEN:
         print("HATA: TELEGRAM_BOT_TOKEN ortam degiskeni bulunamadi.", file=sys.stderr)
         return False
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     for attempt in range(1, TELEGRAM_RETRIES + 1):
         try:
-            resp = requests.post(url, data=data, timeout=timeout)
+            resp = requests.post(url, data=data, timeout=timeout, files=files)
         except requests.exceptions.RequestException as exc:
             print(f"Telegram istegi basarisiz (deneme {attempt}/{TELEGRAM_RETRIES}): {exc}", file=sys.stderr)
         else:
@@ -246,10 +249,41 @@ def send_photo_to_telegram(image_url: str, caption: str) -> bool:
     }, timeout=20)
 
 
+def send_card_to_telegram(image_bytes: bytes, caption: str) -> bool:
+    return telegram_post(
+        "sendPhoto",
+        {"chat_id": CHANNEL, "caption": caption, "parse_mode": "HTML"},
+        timeout=25,
+        files={"photo": ("gundem360.jpg", image_bytes, "image/jpeg")},
+    )
+
+
+def try_post_card(source_name: str, entry, image_url: str, raw_title: str, body_text: str, breaking: bool) -> bool:
+    try:
+        resp = requests.get(image_url, timeout=ARTICLE_FETCH_TIMEOUT, headers=ARTICLE_FETCH_HEADERS)
+        resp.raise_for_status()
+        category = categorize(source_name, raw_title, body_text[:500])
+        card_bytes = generate_card(resp.content, raw_title, category, breaking)
+    except Exception as exc:
+        print(f"Kart olusturulamadi ({image_url}): {exc}", file=sys.stderr)
+        return False
+
+    caption = f"Kaynak: {html.escape(source_name)}\n\n<i>gundem360</i>"
+    return send_card_to_telegram(card_bytes, caption)
+
+
 def post_entry(source_name: str, entry) -> bool:
     body_text = get_body_text(entry)
+    raw_title = strip_html(entry.get("title", ""))
+    breaking = is_breaking(raw_title, body_text[:300])
     image_url = find_image(entry)
+
     if image_url:
+        if (breaking or random.random() < CARD_POST_CHANCE) and try_post_card(
+            source_name, entry, image_url, raw_title, body_text, breaking
+        ):
+            return True
+
         caption = build_message(source_name, entry, body_text, summary_max_len=CAPTION_SUMMARY_MAX_LEN)
         if send_photo_to_telegram(image_url, caption):
             return True
