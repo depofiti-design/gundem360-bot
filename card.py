@@ -1,5 +1,4 @@
 import io
-import random
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -84,30 +83,59 @@ def _rounded_pill(draw, xy, text, font, fg, bg, pad_x=22, pad_y=12):
     return box[2] - box[0]  # width consumed
 
 
-def generate_card(photo_bytes: bytes, headline: str, category: str, breaking: bool, grayscale: bool | None = None) -> bytes:
-    img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
-
+def _fit_cover(img: Image.Image) -> Image.Image:
     w, h = img.size
     scale = CARD_SIZE / min(w, h)
     img = img.resize((max(CARD_SIZE, round(w * scale)), max(CARD_SIZE, round(h * scale))), Image.LANCZOS)
     w, h = img.size
     left, top = (w - CARD_SIZE) // 2, (h - CARD_SIZE) // 2
-    img = img.crop((left, top, left + CARD_SIZE, top + CARD_SIZE))
+    return img.crop((left, top, left + CARD_SIZE, top + CARD_SIZE))
 
-    if grayscale is None:
-        grayscale = random.random() < 0.5
-    if grayscale:
-        img = ImageOps.grayscale(img).convert("RGB")
 
-    overlay = Image.new("RGBA", (CARD_SIZE, CARD_SIZE), (0, 0, 0, 0))
-    odraw = ImageDraw.Draw(overlay)
-    odraw.rectangle([0, 0, CARD_SIZE, CARD_SIZE], fill=(0, 0, 0, 80))
-    grad_h = int(CARD_SIZE * 0.65)
-    for i in range(grad_h):
-        alpha = int(185 * (i / grad_h))
-        y = CARD_SIZE - grad_h + i
-        odraw.line([(0, y), (CARD_SIZE, y)], fill=(0, 0, 0, alpha))
-    img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+def _solid_background(category: str) -> Image.Image:
+    # Used only when the article has no photo, so every post still gets a branded card.
+    base = CATEGORY_COLORS.get(category, CATEGORY_COLORS[DEFAULT_CATEGORY])
+    top_color = (20, 21, 26)
+    bottom_color = tuple(int(c * 0.4) for c in base)
+    img = Image.new("RGB", (CARD_SIZE, CARD_SIZE))
+    draw = ImageDraw.Draw(img)
+    for y in range(CARD_SIZE):
+        t = y / CARD_SIZE
+        row = tuple(int(top_color[i] + (bottom_color[i] - top_color[i]) * t) for i in range(3))
+        draw.line([(0, y), (CARD_SIZE, y)], fill=row)
+    return img
+
+
+def _legibility_overlay(size: int) -> Image.Image:
+    # A single smooth fade: fully clear over the photo, darkening only behind the
+    # text block at the bottom. No flat wash, so photos stay bright and sharp.
+    # A short, gentle top band keeps the brand/handle text readable over bright skies.
+    overlay = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    top_band = int(size * 0.12)
+    top_max_alpha = 80
+    fade_start = 0.42
+    max_alpha = 190
+    for y in range(size):
+        if y < top_band:
+            alpha = int(top_max_alpha * (1 - y / top_band))
+            draw.line([(0, y), (size, y)], fill=(0, 0, 0, alpha))
+            continue
+        f = y / size
+        if f <= fade_start:
+            continue
+        t = (f - fade_start) / (1 - fade_start)
+        draw.line([(0, y), (size, y)], fill=(0, 0, 0, int(max_alpha * (t ** 1.5))))
+    return overlay
+
+
+def generate_card(photo_bytes: bytes | None, headline: str, category: str, breaking: bool) -> bytes:
+    if photo_bytes:
+        img = _fit_cover(Image.open(io.BytesIO(photo_bytes)).convert("RGB"))
+    else:
+        img = _solid_background(category)
+
+    img = Image.alpha_composite(img.convert("RGBA"), _legibility_overlay(CARD_SIZE)).convert("RGB")
 
     draw = ImageDraw.Draw(img)
 

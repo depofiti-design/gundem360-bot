@@ -23,7 +23,6 @@ CAPTION_SUMMARY_MAX_LEN = 650  # Telegram photo captions are capped at 1024 char
 DELAY_BETWEEN_POSTS = 4  # seconds, stays well under Telegram's rate limits
 ARTICLE_FETCH_TIMEOUT = 10
 ARTICLE_FETCH_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-CARD_POST_CHANCE = 0.05  # non-breaking odds of using the graphic card style instead of a plain photo post
 
 CHANNEL = "@gundem360haber"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -258,12 +257,15 @@ def send_card_to_telegram(image_bytes: bytes, caption: str) -> bool:
     )
 
 
-def try_post_card(source_name: str, entry, image_url: str, raw_title: str, body_text: str, breaking: bool) -> bool:
+def try_post_card(source_name: str, raw_title: str, body_text: str, image_url: str | None, breaking: bool) -> bool:
     try:
-        resp = requests.get(image_url, timeout=ARTICLE_FETCH_TIMEOUT, headers=ARTICLE_FETCH_HEADERS)
-        resp.raise_for_status()
+        photo_bytes = None
+        if image_url:
+            resp = requests.get(image_url, timeout=ARTICLE_FETCH_TIMEOUT, headers=ARTICLE_FETCH_HEADERS)
+            resp.raise_for_status()
+            photo_bytes = resp.content
         category = categorize(source_name, raw_title, body_text[:500])
-        card_bytes = generate_card(resp.content, raw_title, category, breaking)
+        card_bytes = generate_card(photo_bytes, raw_title, category, breaking)
     except Exception as exc:
         print(f"Kart olusturulamadi ({image_url}): {exc}", file=sys.stderr)
         return False
@@ -278,16 +280,14 @@ def post_entry(source_name: str, entry) -> bool:
     breaking = is_breaking(raw_title, body_text[:300])
     image_url = find_image(entry)
 
-    if image_url:
-        if (breaking or random.random() < CARD_POST_CHANCE) and try_post_card(
-            source_name, entry, image_url, raw_title, body_text, breaking
-        ):
-            return True
+    if try_post_card(source_name, raw_title, body_text, image_url, breaking):
+        return True
 
+    # Card generation/send failed - fall back to a plain photo or text post.
+    if image_url:
         caption = build_message(source_name, entry, body_text, summary_max_len=CAPTION_SUMMARY_MAX_LEN)
         if send_photo_to_telegram(image_url, caption):
             return True
-        # Image failed to send (bad url, hotlink block, wrong format) - fall back to text.
     return send_to_telegram(build_message(source_name, entry, body_text, summary_max_len=SUMMARY_MAX_LEN))
 
 
