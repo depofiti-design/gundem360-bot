@@ -20,6 +20,7 @@ MAX_POSTS_PER_RUN = 12
 MAX_POSTS_PER_FEED = 2
 SUMMARY_MAX_LEN = 800
 CAPTION_SUMMARY_MAX_LEN = 650  # Telegram photo captions are capped at 1024 chars total
+CARD_CAPTION_SUMMARY_LEN = 450  # shorter, since the card image itself already carries the headline
 DELAY_BETWEEN_POSTS = 4  # seconds, stays well under Telegram's rate limits
 ARTICLE_FETCH_TIMEOUT = 10
 ARTICLE_FETCH_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -257,6 +258,16 @@ def send_card_to_telegram(image_bytes: bytes, caption: str) -> bool:
     )
 
 
+def build_card_caption(source_name: str, body_text: str) -> str:
+    summary = clean_excerpt(body_text, CARD_CAPTION_SUMMARY_LEN)
+    parts = []
+    if summary:
+        parts.append(f"<b>{html.escape(summary)}</b>")
+    parts.append(f"Kaynak: {html.escape(source_name)}")
+    parts.append("<i>gundem360</i>")
+    return "\n\n".join(parts)
+
+
 def try_post_card(source_name: str, raw_title: str, body_text: str, image_url: str | None, breaking: bool) -> bool:
     try:
         photo_bytes = None
@@ -270,7 +281,7 @@ def try_post_card(source_name: str, raw_title: str, body_text: str, image_url: s
         print(f"Kart olusturulamadi ({image_url}): {exc}", file=sys.stderr)
         return False
 
-    caption = f"Kaynak: {html.escape(source_name)}\n\n<i>gundem360</i>"
+    caption = build_card_caption(source_name, body_text)
     return send_card_to_telegram(card_bytes, caption)
 
 
