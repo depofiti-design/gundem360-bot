@@ -1,13 +1,17 @@
 import io
+import re
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 BASE_DIR = Path(__file__).resolve().parent
 FONTS_DIR = BASE_DIR / "assets" / "fonts"
 
 CARD_SIZE = 1080
-MARGIN = 56
+MARGIN = 48
+PHOTO_H = 620
+PANEL_COLOR = (8, 14, 30)
+LOGO_PATH = BASE_DIR / "assets" / "logo.png"
 
 CATEGORY_RULES = [
     ("SPOR", ("maç", "gol", "transfer", "lig", "futbol", "basketbol", "voleybol", "şampiyon", "derbi", "milli takım", "teknik direktör")),
@@ -17,6 +21,8 @@ CATEGORY_RULES = [
     ("TEKNOLOJİ", ("yapay zeka", "teknoloji", "telefon", "uygulama", "yazılım", "elektrikli araç", "uzay", "roket")),
 ]
 DEFAULT_CATEGORY = "GÜNDEM"
+
+CATEGORY_EMOJI = {"SPOR": "⚽", "EKONOMİ": "💰", "DÜNYA": "🌍", "SAĞLIK": "🩺", "TEKNOLOJİ": "💻", "GÜNDEM": "📰"}
 
 CATEGORY_COLORS = {
     "SPOR": (45, 108, 223),
@@ -29,12 +35,21 @@ CATEGORY_COLORS = {
 BREAKING_RED = (210, 24, 24)
 
 
-def categorize(*texts: str) -> str:
-    joined = " ".join(texts).lower()
+def _match_category(text: str):
     for label, keywords in CATEGORY_RULES:
-        if any(kw in joined for kw in keywords):
-            return label
-    return DEFAULT_CATEGORY
+        for kw in keywords:
+            # keyword must start a word ("abd" must not match "Abdullah"); suffixes are allowed
+            word = kw.strip()
+            # short acronyms/words additionally allow at most a 3-letter suffix ("abd" must not match "abdullah")
+            tail = r"(?![a-zçğıöşü]{4})" if len(word) <= 4 else ""
+            if re.search(r"(?<!\w)" + re.escape(word) + tail, text):
+                return label
+    return None
+
+
+def categorize(title: str, body: str = "") -> str:
+    # The headline decides first; the body only breaks the tie when the headline is neutral.
+    return _match_category(title.lower()) or _match_category(body.lower()) or DEFAULT_CATEGORY
 
 
 def _font(name: str, size: int) -> ImageFont.FreeTypeFont:
@@ -58,7 +73,7 @@ def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFon
 
 
 def _fit_headline(draw, headline: str, max_width: int, max_height: int):
-    for size in range(72, 39, -4):
+    for size in range(68, 37, -4):
         font = _font("Poppins-ExtraBold.ttf", size)
         lines = _wrap_text(draw, headline, font, max_width)
         line_height = (font.getbbox("Ağİ")[3] - font.getbbox("Ağİ")[1]) + 14
@@ -66,7 +81,7 @@ def _fit_headline(draw, headline: str, max_width: int, max_height: int):
         if len(lines) <= 4 and block_height <= max_height:
             return font, lines, line_height
     # fallback: smallest size, truncate to 4 lines
-    font = _font("Poppins-ExtraBold.ttf", 40)
+    font = _font("Poppins-ExtraBold.ttf", 38)
     lines = _wrap_text(draw, headline, font, max_width)[:4]
     line_height = (font.getbbox("Ağİ")[3] - font.getbbox("Ağİ")[1]) + 14
     return font, lines, line_height
@@ -83,94 +98,111 @@ def _rounded_pill(draw, xy, text, font, fg, bg, pad_x=22, pad_y=12):
     return box[2] - box[0]  # width consumed
 
 
-def _fit_cover(img: Image.Image) -> Image.Image:
+def _cover(img: Image.Image, width: int, height: int, focus_y: float = 0.38) -> Image.Image:
+    # Scale to cover the box, crop with a slight upward bias (heads/faces sit high in frame).
     w, h = img.size
-    scale = CARD_SIZE / min(w, h)
-    img = img.resize((max(CARD_SIZE, round(w * scale)), max(CARD_SIZE, round(h * scale))), Image.LANCZOS)
-    w, h = img.size
-    left, top = (w - CARD_SIZE) // 2, (h - CARD_SIZE) // 2
-    return img.crop((left, top, left + CARD_SIZE, top + CARD_SIZE))
+    scale = max(width / w, height / h)
+    new_w, new_h = max(width, round(w * scale)), max(height, round(h * scale))
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    if scale > 1.15:
+        img = img.filter(ImageFilter.UnsharpMask(radius=1.4, percent=70, threshold=2))
+    left = (new_w - width) // 2
+    top = int((new_h - height) * focus_y)
+    return img.crop((left, top, left + width, top + height))
 
 
-def _solid_background(category: str) -> Image.Image:
-    # Used only when the article has no photo, so every post still gets a branded card.
+def _logo(size: int) -> Image.Image:
+    return Image.open(LOGO_PATH).convert("RGBA").resize((size, size), Image.LANCZOS)
+
+
+def _no_photo_area(category: str) -> Image.Image:
+    # No usable photo: category-tinted gradient with the big brand logo, so the card still looks intentional.
     base = CATEGORY_COLORS.get(category, CATEGORY_COLORS[DEFAULT_CATEGORY])
-    top_color = (20, 21, 26)
-    bottom_color = tuple(int(c * 0.4) for c in base)
-    img = Image.new("RGB", (CARD_SIZE, CARD_SIZE))
+    top_color = tuple(int(c * 0.55) for c in base)
+    img = Image.new("RGB", (CARD_SIZE, PHOTO_H))
     draw = ImageDraw.Draw(img)
-    for y in range(CARD_SIZE):
-        t = y / CARD_SIZE
-        row = tuple(int(top_color[i] + (bottom_color[i] - top_color[i]) * t) for i in range(3))
+    for y in range(PHOTO_H):
+        t = y / PHOTO_H
+        row = tuple(int(top_color[i] + (PANEL_COLOR[i] - top_color[i]) * t) for i in range(3))
         draw.line([(0, y), (CARD_SIZE, y)], fill=row)
+    logo = _logo(300)
+    img.paste(logo, ((CARD_SIZE - 300) // 2, (PHOTO_H - 300) // 2 - 10), logo)
     return img
 
 
-def _legibility_overlay(size: int) -> Image.Image:
-    # A single smooth fade: fully clear over the photo, darkening only behind the
-    # text block at the bottom. No flat wash, so photos stay bright and sharp.
-    # A short, gentle top band keeps the brand/handle text readable over bright skies.
-    overlay = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+def _fade_into_panel(card: Image.Image) -> None:
+    # Short smooth blend from the (untouched, clear) photo into the dark text panel.
+    fade_h = 110
+    overlay = Image.new("RGBA", (CARD_SIZE, fade_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    top_band = int(size * 0.12)
-    top_max_alpha = 80
-    fade_start = 0.42
-    max_alpha = 190
-    for y in range(size):
-        if y < top_band:
-            alpha = int(top_max_alpha * (1 - y / top_band))
-            draw.line([(0, y), (size, y)], fill=(0, 0, 0, alpha))
-            continue
-        f = y / size
-        if f <= fade_start:
-            continue
-        t = (f - fade_start) / (1 - fade_start)
-        draw.line([(0, y), (size, y)], fill=(0, 0, 0, int(max_alpha * (t ** 1.5))))
-    return overlay
+    for y in range(fade_h):
+        alpha = int(255 * ((y / (fade_h - 1)) ** 1.6))
+        draw.line([(0, y), (CARD_SIZE, y)], fill=PANEL_COLOR + (alpha,))
+    region = card.crop((0, PHOTO_H - fade_h, CARD_SIZE, PHOTO_H)).convert("RGBA")
+    card.paste(Image.alpha_composite(region, overlay).convert("RGB"), (0, PHOTO_H - fade_h))
 
 
-def generate_card(photo_bytes: bytes | None, headline: str, category: str, breaking: bool) -> bytes:
+def _translucent_pill(card: Image.Image, xy, text, font, alpha=130):
+    x, y = xy
+    draw = ImageDraw.Draw(card)
+    bbox = font.getbbox(text)
+    w = int(draw.textlength(text, font=font)) + 36
+    h = (bbox[3] - bbox[1]) + 22
+    layer = Image.new("RGBA", card.size, (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+    ld.rounded_rectangle([x, y, x + w, y + h], radius=h // 2, fill=(0, 0, 0, alpha))
+    merged = Image.alpha_composite(card.convert("RGBA"), layer).convert("RGB")
+    card.paste(merged)
+    ImageDraw.Draw(card).text((x + 18, y + 11 - bbox[1]), text, font=font, fill="white")
+    return w
+
+
+def generate_card(photo_bytes: bytes | None, headline: str, category: str, breaking: bool, source_label: str = "") -> bytes:
+    card = Image.new("RGB", (CARD_SIZE, CARD_SIZE), PANEL_COLOR)
     if photo_bytes:
-        img = _fit_cover(Image.open(io.BytesIO(photo_bytes)).convert("RGB"))
+        photo = _cover(Image.open(io.BytesIO(photo_bytes)).convert("RGB"), CARD_SIZE, PHOTO_H)
+        card.paste(photo, (0, 0))
+        _fade_into_panel(card)
+        # Small logo badge over the photo (white circle reads on any picture).
+        logo_size = 96
+        shadow = Image.new("RGBA", card.size, (0, 0, 0, 0))
+        ImageDraw.Draw(shadow).ellipse([MARGIN - 4, 34, MARGIN + logo_size + 4, 34 + logo_size + 8], fill=(0, 0, 0, 90))
+        shadow = shadow.filter(ImageFilter.GaussianBlur(8))
+        card.paste(Image.alpha_composite(card.convert("RGBA"), shadow).convert("RGB"))
+        logo = _logo(logo_size)
+        card.paste(logo, (MARGIN, 32), logo)
     else:
-        img = _solid_background(category)
+        card.paste(_no_photo_area(category), (0, 0))
 
-    img = Image.alpha_composite(img.convert("RGBA"), _legibility_overlay(CARD_SIZE)).convert("RGB")
+    font_handle = _font("Poppins-Bold.ttf", 22)
+    handle = "t.me/gundem360haber"
+    handle_w = int(ImageDraw.Draw(card).textlength(handle, font=font_handle)) + 36
+    _translucent_pill(card, (CARD_SIZE - MARGIN - handle_w, 46), handle, font_handle)
 
-    draw = ImageDraw.Draw(img)
-
-    font_brand = _font("Poppins-ExtraBold.ttf", 30)
-    font_handle = _font("Poppins-Bold.ttf", 20)
-    font_badge = _font("Poppins-ExtraBold.ttf", 28)
+    draw = ImageDraw.Draw(card)
+    font_badge = _font("Poppins-ExtraBold.ttf", 26)
     font_tag = _font("Poppins-Bold.ttf", 24)
+    font_source = _font("Poppins-SemiBold.ttf", 22)
 
-    draw.text((MARGIN, MARGIN), "GÜNDEM360", font=font_brand, fill="white")
-    handle_text = "TELEGRAM: GUNDEM360HABER"
-    handle_w = draw.textlength(handle_text, font=font_handle)
-    draw.text((CARD_SIZE - MARGIN - handle_w, MARGIN + 6), handle_text, font=font_handle, fill="white")
+    pills_y = PHOTO_H + 4
+    x = MARGIN
+    if breaking:
+        x += _rounded_pill(draw, (x, pills_y), "SON DAKİKA", font_badge, "white", BREAKING_RED) + 14
+    tag_color = CATEGORY_COLORS.get(category, CATEGORY_COLORS[DEFAULT_CATEGORY])
+    _rounded_pill(draw, (x, pills_y), category, font_tag, "white", tag_color)
+    if source_label:
+        label = source_label.upper()
+        label_w = draw.textlength(label, font=font_source)
+        draw.text((CARD_SIZE - MARGIN - label_w, pills_y + 12), label, font=font_source, fill=(150, 162, 190))
 
-    content_width = CARD_SIZE - MARGIN * 2
-    tag_y = CARD_SIZE - MARGIN - 54
-    max_headline_height = int(CARD_SIZE * 0.34)
-    headline_area_bottom = tag_y - 26
-
-    font_headline, lines, line_height = _fit_headline(draw, headline, content_width, max_headline_height)
-    block_height = line_height * len(lines)
-    headline_top = headline_area_bottom - block_height
-    badge_bottom = headline_top - 22
-
+    headline_top = pills_y + 50 + 26
+    max_height = CARD_SIZE - 44 - headline_top
+    font_headline, lines, line_height = _fit_headline(draw, headline, CARD_SIZE - MARGIN * 2, max_height)
     y = headline_top
     for line in lines:
         draw.text((MARGIN, y), line, font=font_headline, fill="white")
         y += line_height
 
-    if breaking:
-        badge_h_est = font_badge.getbbox("SON DAKİKA")[3] + 24
-        _rounded_pill(draw, (MARGIN, badge_bottom - badge_h_est), "SON DAKİKA", font_badge, "white", BREAKING_RED)
-
-    tag_color = CATEGORY_COLORS.get(category, CATEGORY_COLORS[DEFAULT_CATEGORY])
-    _rounded_pill(draw, (MARGIN, tag_y), category, font_tag, "white", tag_color)
-
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=90)
+    card.save(buf, format="JPEG", quality=92, subsampling=0)
     return buf.getvalue()

@@ -16,10 +16,10 @@ def main():
     seen = bot.load_seen()
     posted = 0
 
-    for source_name, url in bot.SOURCES:
+    for source_name, url, forced_category in bot.SOURCES:
         if posted >= TARGET_TOTAL:
             break
-        feed = feedparser.parse(url)
+        feed = bot.fetch_feed(url)
         posted_from_source = 0
         for entry in feed.entries:
             if posted >= TARGET_TOTAL or posted_from_source >= MAX_PER_SOURCE:
@@ -27,7 +27,7 @@ def main():
             eid = bot.entry_id(entry)
             if not eid or eid in seen:
                 continue
-            ok = bot.post_entry(source_name, entry)
+            ok = bot.post_entry(source_name, entry, forced_category)
             has_img = bool(bot.find_image(entry))
             print(f"[{'OK' if ok else 'HATA'}] (img={has_img}) {source_name}: {entry.get('title', '')[:60]}")
             if ok:

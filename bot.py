@@ -3,24 +3,32 @@ import json
 import os
 import random
 import re
+import io
 import sys
 import time
+from calendar import timegm
 from pathlib import Path
 
 import feedparser
 import requests
 import trafilatura
+from PIL import Image
 
-from card import categorize, generate_card
+from card import CATEGORY_EMOJI, categorize, generate_card
 
 BASE_DIR = Path(__file__).resolve().parent
 SEEN_FILE = BASE_DIR / "seen.json"
-MAX_SEEN_KEPT = 1500
+MAX_SEEN_KEPT = 3000
 MAX_POSTS_PER_RUN = 12
 MAX_POSTS_PER_FEED = 2
+MAX_SPORTS_PER_RUN = 4
+MAX_ENTRY_AGE_HOURS = 24  # older items are marked seen without posting (new feeds start with a backlog)
+MIN_PHOTO_WIDTH = 500
+BREAKING_MAX_AGE_HOURS = 3
 SUMMARY_MAX_LEN = 800
 CAPTION_SUMMARY_MAX_LEN = 650  # Telegram photo captions are capped at 1024 chars total
-CARD_CAPTION_SUMMARY_LEN = 450  # shorter, since the card image itself already carries the headline
+CARD_LEAD_LEN = 260  # bold "hook" sentences at the top of the caption
+CARD_DETAIL_LEN = 420  # plain follow-up sentences below the hook
 DELAY_BETWEEN_POSTS = 4  # seconds, stays well under Telegram's rate limits
 ARTICLE_FETCH_TIMEOUT = 10
 ARTICLE_FETCH_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -28,22 +36,43 @@ ARTICLE_FETCH_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64
 CHANNEL = "@gundem360haber"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
+# (display name, feed url, forced category or None)
 SOURCES = [
-    ("AA - Guncel", "https://www.aa.com.tr/tr/rss/default?cat=guncel"),
-    ("AA - Dunya", "https://www.aa.com.tr/tr/rss/default?cat=dunya"),
-    ("NTV", "https://www.ntv.com.tr/gundem.rss"),
-    ("Hurriyet", "https://www.hurriyet.com.tr/rss/anasayfa"),
-    ("Sabah", "https://www.sabah.com.tr/rss/anasayfa.xml"),
-    ("Milliyet", "https://www.milliyet.com.tr/rss/rssnew/gundemrss.xml"),
-    ("CNN Turk", "https://www.cnnturk.com/feed/rss/all/news"),
-    ("BBC Turkce", "https://feeds.bbci.co.uk/turkce/rss.xml"),
+    ("Anadolu Ajansı", "https://www.aa.com.tr/tr/rss/default?cat=guncel", None),
+    ("Anadolu Ajansı", "https://www.aa.com.tr/tr/rss/default?cat=dunya", "DÜNYA"),
+    ("NTV", "https://www.ntv.com.tr/gundem.rss", None),
+    ("Hürriyet", "https://www.hurriyet.com.tr/rss/anasayfa", None),
+    ("Sabah", "https://www.sabah.com.tr/rss/anasayfa.xml", None),
+    ("Milliyet", "https://www.milliyet.com.tr/rss/rssnew/gundemrss.xml", None),
+    ("CNN Türk", "https://www.cnnturk.com/feed/rss/all/news", None),
+    ("BBC Türkçe", "https://feeds.bbci.co.uk/turkce/rss.xml", None),
+    ("TRT Haber", "https://www.trthaber.com/manset_articles.rss", None),
+    ("Habertürk", "https://www.haberturk.com/rss", None),
+    ("TRT Haber", "https://www.trthaber.com/dunya_articles.rss", "DÜNYA"),
+    ("TRT Haber", "https://www.trthaber.com/ekonomi_articles.rss", "EKONOMİ"),
+    ("Sabah", "https://www.sabah.com.tr/rss/ekonomi.xml", "EKONOMİ"),
+    # Sports: many different outlets so the channel doesn't read like a single-source feed
+    ("Hürriyet Spor", "https://www.hurriyet.com.tr/rss/spor", "SPOR"),
+    ("Sabah Spor", "https://www.sabah.com.tr/rss/spor.xml", "SPOR"),
+    ("TRT Spor", "https://www.trthaber.com/spor_articles.rss", "SPOR"),
+    ("Fotomaç", "https://www.fotomac.com.tr/rss/anasayfa.xml", "SPOR"),
+    ("Habertürk Spor", "https://www.haberturk.com/rss/spor.xml", "SPOR"),
+    ("A Spor", "https://www.aspor.com.tr/rss/anasayfa.xml", "SPOR"),
+    ("Takvim Spor", "https://www.takvim.com.tr/rss/spor.xml", "SPOR"),
+    ("CNN Türk Spor", "https://www.cnnturk.com/feed/rss/spor/news", "SPOR"),
+    ("Anadolu Ajansı Spor", "https://www.aa.com.tr/tr/rss/default?cat=spor", "SPOR"),
 ]
 
 BREAKING_KEYWORDS = [
     "son dakika", "flas", "flaş", "deprem", "savas", "savaş", "saldırı", "saldiri",
     "patlama", "füze", "fuze", "ateşkes", "ateskes", "çatışma", "catisma", "bomba",
     "katliam", "işgal", "isgal", "darbe", "suikast", "ölü sayısı", "olu sayisi",
-    "tahliye", "acil durum", "kriz",
+    "tahliye", "acil durum", "kriz", "hayatını kaybetti", "hayatini kaybetti", "yaşamını yitirdi",
+    "vefat etti", "öldü", "yangın",
+]
+# Football gossip uses "kriz", "bomba", "savaş" figuratively - only literal tragedies count as breaking there.
+SPORTS_BREAKING_KEYWORDS = [
+    "son dakika", "flaş", "deprem", "saldırı", "hayatını kaybetti", "yaşamını yitirdi", "vefat etti", "kazası", "kazada",
 ]
 
 TAG_RE = re.compile(r"<[^>]+>")
@@ -73,9 +102,10 @@ def entry_id(entry) -> str:
     return entry.get("id") or entry.get("link") or entry.get("title", "")
 
 
-def is_breaking(title: str, summary: str) -> bool:
+def is_breaking(title: str, summary: str, category: str = "") -> bool:
     text = f"{title} {summary}".lower()
-    return any(keyword in text for keyword in BREAKING_KEYWORDS)
+    keywords = SPORTS_BREAKING_KEYWORDS if category == "SPOR" else BREAKING_KEYWORDS
+    return any(keyword in text for keyword in keywords)
 
 
 def find_image(entry) -> str | None:
@@ -99,16 +129,56 @@ def find_image(entry) -> str | None:
     return None
 
 
-def fetch_full_text(url: str) -> str | None:
+OG_IMAGE_RES = [
+    re.compile(r"""<meta[^>]+(?:property|name)=["'](?:og:image(?::secure_url)?|twitter:image(?::src)?)["'][^>]*content=["']([^"']+)["']""", re.IGNORECASE),
+    re.compile(r"""<meta[^>]+content=["']([^"']+)["'][^>]*(?:property|name)=["'](?:og:image(?::secure_url)?|twitter:image(?::src)?)["']""", re.IGNORECASE),
+]
+
+
+def fetch_article(url: str) -> tuple[str | None, str]:
+    """Returns (extracted article text, raw page html). Either may be empty on failure."""
     if not url:
-        return None
+        return None, ""
     try:
         resp = requests.get(url, timeout=ARTICLE_FETCH_TIMEOUT, headers=ARTICLE_FETCH_HEADERS)
         resp.raise_for_status()
-        return trafilatura.extract(resp.text, url=url, include_comments=False, include_tables=False)
+        page = resp.text
+        return trafilatura.extract(page, url=url, include_comments=False, include_tables=False), page
     except Exception as exc:
         print(f"Tam metin alinamadi ({url}): {exc}", file=sys.stderr)
-        return None
+        return None, ""
+
+
+def og_images(page_html: str, base_url: str) -> list[str]:
+    urls = []
+    for pattern in OG_IMAGE_RES:
+        for match in pattern.findall(page_html or ""):
+            url = html.unescape(match).strip()
+            if url.startswith("//"):
+                url = "https:" + url
+            elif url.startswith("/"):
+                url = requests.compat.urljoin(base_url, url)
+            if url.startswith("http") and url not in urls:
+                urls.append(url)
+    return urls
+
+
+def best_photo(candidates: list[str]) -> bytes | None:
+    """Downloads candidate images and returns the sharpest (largest) usable one, or None."""
+    best_bytes, best_pixels = None, 0
+    for url in candidates[:4]:
+        try:
+            resp = requests.get(url, timeout=ARTICLE_FETCH_TIMEOUT, headers=ARTICLE_FETCH_HEADERS)
+            resp.raise_for_status()
+            width, height = Image.open(io.BytesIO(resp.content)).size
+        except Exception as exc:
+            print(f"Gorsel alinamadi ({url}): {exc}", file=sys.stderr)
+            continue
+        if width < MIN_PHOTO_WIDTH or height < 250 or width / height > 3.2 or height / width > 2.0:
+            continue  # thumbnail, banner or odd crop: would look blurry/stretched on the card
+        if width * height > best_pixels:
+            best_bytes, best_pixels = resp.content, width * height
+    return best_bytes
 
 
 TR_MONTHS = "Ocak|Şubat|Mart|Nisan|Mayıs|Haziran|Temmuz|Ağustos|Eylül|Ekim|Kasım|Aralık"
@@ -127,7 +197,13 @@ SOCIAL_NOISE_LINE_RE = re.compile(
 )
 
 
+AGENCY_BYLINE_RE = re.compile(
+    r"[A-ZÇĞİÖŞÜ][\w.]+(?: [A-ZÇĞİÖŞÜ][\w.]+){0,2}\s*•\s*[A-ZÇĞİÖŞÜ]{3,}(?: [A-ZÇĞİÖŞÜ]{3,})?\s+"
+)  # "Ceren Aydınonat • İSTANBUL " reporter/dateline prefix
+
+
 def strip_boilerplate(text: str, title: str = "") -> str:
+    text = AGENCY_BYLINE_RE.sub("", text)
     text = UPDATE_LABEL_RE.sub("", text)
     text = DATE_LINE_RE.sub("", text)
     text = NUMERIC_DATE_RE.sub("", text)
@@ -160,13 +236,17 @@ def clean_rss_teaser(entry) -> str:
     return raw.strip()
 
 
-def get_body_text(entry) -> str:
-    full_text = fetch_full_text(entry.get("link", ""))
+def get_body_text(entry, full_text: str | None) -> str:
+    title = strip_html(entry.get("title", ""))
     if full_text:
-        full_text = strip_boilerplate(full_text, title=strip_html(entry.get("title", "")))
-        if len(full_text) > 40:
-            return full_text
-    return clean_rss_teaser(entry)
+        cleaned = strip_boilerplate(full_text, title=title)
+        if len(cleaned) > 40:
+            return cleaned
+    teaser = clean_rss_teaser(entry)
+    cleaned = strip_boilerplate(teaser, title=title)
+    if cleaned or teaser.casefold() == title.casefold():
+        return cleaned
+    return teaser
 
 
 def clean_excerpt(text: str, max_len: int) -> str:
@@ -258,62 +338,118 @@ def send_card_to_telegram(image_bytes: bytes, caption: str) -> bool:
     )
 
 
-def build_card_caption(source_name: str, body_text: str) -> str:
-    summary = clean_excerpt(body_text, CARD_CAPTION_SUMMARY_LEN)
+def pick_sentences(sentences: list[str], max_len: int) -> tuple[list[str], list[str]]:
+    """Takes whole sentences up to max_len (always at least one). Returns (picked, remaining)."""
+    picked, total = [], 0
+    for index, sentence in enumerate(sentences):
+        if picked and total + len(sentence) + 1 > max_len:
+            return picked, sentences[index:]
+        picked.append(sentence)
+        total += len(sentence) + 1
+    return picked, []
+
+
+def build_card_caption(source_name: str, title: str, body_text: str, category: str, breaking: bool) -> str:
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", (body_text or "").replace("\n", " ")) if s.strip()]
+    lead_sentences, rest = pick_sentences(sentences, CARD_LEAD_LEN) if sentences else ([], [])
+    lead = " ".join(lead_sentences)
+    if len(lead) > CARD_LEAD_LEN + 120:
+        lead = clean_excerpt(lead, CARD_LEAD_LEN + 120)
+    detail_sentences, _ = pick_sentences(rest, CARD_DETAIL_LEN) if rest else ([], [])
+    detail = " ".join(detail_sentences)
+    if len(detail) > CARD_DETAIL_LEN + 150:
+        detail = clean_excerpt(detail, CARD_DETAIL_LEN + 150)
+
     parts = []
-    if summary:
-        parts.append(f"<b>{html.escape(summary)}</b>")
-    parts.append(f"Kaynak: {html.escape(source_name)}")
-    parts.append("<i>gundem360</i>")
+    if breaking:
+        parts.append("🚨 <b>SON DAKİKA</b> 🚨")
+    emoji = CATEGORY_EMOJI.get(category, "📰")
+    parts.append(f"{emoji} <b>{html.escape(lead or title, quote=False)}</b>")
+    if detail:
+        parts.append(html.escape(detail, quote=False))
+    tags = "#" + category.replace("İ", "i").replace("Ü", "ü").capitalize().replace(" ", "")
+    if breaking:
+        tags += " #SonDakika"
+    parts.append(f"Kaynak: {html.escape(source_name, quote=False)}\n<i>gundem360</i> · {tags}")
     return "\n\n".join(parts)
 
 
-def try_post_card(source_name: str, raw_title: str, body_text: str, image_url: str | None, breaking: bool) -> bool:
-    try:
-        photo_bytes = None
-        if image_url:
-            resp = requests.get(image_url, timeout=ARTICLE_FETCH_TIMEOUT, headers=ARTICLE_FETCH_HEADERS)
-            resp.raise_for_status()
-            photo_bytes = resp.content
-        category = categorize(source_name, raw_title, body_text[:500])
-        card_bytes = generate_card(photo_bytes, raw_title, category, breaking)
-    except Exception as exc:
-        print(f"Kart olusturulamadi ({image_url}): {exc}", file=sys.stderr)
+TITLE_STEM_LEN = 5
+
+
+def title_stems(title: str) -> set:
+    text = title.casefold().replace("i̇", "i")
+    return {token[:TITLE_STEM_LEN] for token in re.findall(r"\w+", text) if len(token) > 2}
+
+
+def is_duplicate_story(stems: set, known: list) -> bool:
+    if len(stems) < 3:
         return False
+    for other in known:
+        common = len(stems & other)
+        if common >= 3 and common / min(len(stems), len(other)) >= 0.6:
+            return True
+    return False
 
-    caption = build_card_caption(source_name, body_text)
-    return send_card_to_telegram(card_bytes, caption)
+
+def entry_age_hours(entry) -> float | None:
+    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not parsed:
+        return None
+    return (time.time() - timegm(parsed)) / 3600
 
 
-def post_entry(source_name: str, entry) -> bool:
-    body_text = get_body_text(entry)
-    raw_title = strip_html(entry.get("title", ""))
-    breaking = is_breaking(raw_title, body_text[:300])
-    image_url = find_image(entry)
+def post_entry(source_name: str, entry, forced_category: str | None) -> bool:
+    link = entry.get("link", "")
+    full_text, page_html = fetch_article(link)
+    body_text = get_body_text(entry, full_text)
+    title = strip_html(entry.get("title", ""))
+    category = forced_category or categorize(title, body_text[:250])
+    age = entry_age_hours(entry)
+    # "Son dakika" only for genuinely fresh items, and judged on the headline + opening lines.
+    breaking = (age is None or age <= BREAKING_MAX_AGE_HOURS) and is_breaking(title, body_text[:120], category)
 
-    if try_post_card(source_name, raw_title, body_text, image_url, breaking):
+    rss_image = find_image(entry)
+    photo_bytes = best_photo(og_images(page_html, link) + ([rss_image] if rss_image else []))
+    caption = build_card_caption(source_name, title, body_text, category, breaking)
+
+    try:
+        card_bytes = generate_card(photo_bytes, title, category, breaking, source_name)
+    except Exception as exc:
+        print(f"Kart olusturulamadi ({link}): {exc}", file=sys.stderr)
+        card_bytes = None
+    if card_bytes and send_card_to_telegram(card_bytes, caption):
         return True
 
     # Card generation/send failed - fall back to a plain photo or text post.
-    if image_url:
-        caption = build_message(source_name, entry, body_text, summary_max_len=CAPTION_SUMMARY_MAX_LEN)
-        if send_photo_to_telegram(image_url, caption):
-            return True
-    return send_to_telegram(build_message(source_name, entry, body_text, summary_max_len=SUMMARY_MAX_LEN))
+    if rss_image and send_photo_to_telegram(rss_image, caption):
+        return True
+    return send_to_telegram(caption)
+
+
+def fetch_feed(url: str):
+    resp = requests.get(url, timeout=20, headers=ARTICLE_FETCH_HEADERS)
+    resp.raise_for_status()
+    return feedparser.parse(resp.content)
 
 
 def main():
     seen = load_seen()
     is_bootstrap = len(seen) == 0
     seen_order = list(seen)
+    known_stems = [set(item[2:].split()) for item in seen_order if item.startswith("t:")]
     posted = 0
+    sports_posted = 0
 
     sources = list(SOURCES)
     random.shuffle(sources)
 
-    for source_name, url in sources:
+    for source_name, url, forced_category in sources:
+        is_sports_feed = forced_category == "SPOR"
+        if is_sports_feed and sports_posted >= MAX_SPORTS_PER_RUN:
+            continue
         try:
-            feed = feedparser.parse(url)
+            feed = fetch_feed(url)
         except Exception as exc:  # network/parse errors shouldn't kill the whole run
             print(f"Feed okunamadi ({source_name}): {exc}", file=sys.stderr)
             continue
@@ -324,18 +460,26 @@ def main():
             if not eid or eid in seen:
                 continue
 
-            if is_bootstrap:
-                # First ever run: seed the seen-list without posting, so we don't
-                # dump the whole backlog into the channel at once.
+            age = entry_age_hours(entry)
+            if is_bootstrap or (age is not None and age > MAX_ENTRY_AGE_HOURS):
+                # First ever run / stale backlog of a newly added feed: mark as seen without posting.
                 seen.add(eid)
                 seen_order.append(eid)
                 continue
 
             if new_from_feed >= MAX_POSTS_PER_FEED or posted >= MAX_POSTS_PER_RUN:
                 break
+            if is_sports_feed and sports_posted >= MAX_SPORTS_PER_RUN:
+                break
+
+            stems = title_stems(strip_html(entry.get("title", "")))
+            if is_duplicate_story(stems, known_stems):
+                seen.add(eid)  # same story already posted from another outlet
+                seen_order.append(eid)
+                continue
 
             try:
-                sent = post_entry(source_name, entry)
+                sent = post_entry(source_name, entry, forced_category)
             except Exception as exc:  # a single bad entry shouldn't kill the whole run
                 print(f"Haber gonderilemedi ({source_name}): {exc}", file=sys.stderr)
                 sent = False
@@ -343,15 +487,20 @@ def main():
             if sent:
                 seen.add(eid)
                 seen_order.append(eid)
+                if len(stems) >= 3:
+                    known_stems.append(stems)
+                    seen_order.append("t:" + " ".join(sorted(stems)))
                 posted += 1
                 new_from_feed += 1
+                if is_sports_feed:
+                    sports_posted += 1
                 time.sleep(DELAY_BETWEEN_POSTS)
 
         if posted >= MAX_POSTS_PER_RUN:
             break
 
     save_seen(seen_order)
-    print(f"Bitti. Yeni gonderilen: {posted}. Bootstrap: {is_bootstrap}.")
+    print(f"Bitti. Yeni gonderilen: {posted} (spor: {sports_posted}). Bootstrap: {is_bootstrap}.")
 
 
 if __name__ == "__main__":

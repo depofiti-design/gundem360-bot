@@ -19,7 +19,7 @@ kapalıyken de her saat başı kendiliğinden çalışmaya devam eder.
 
 ## Kaynak eklemek/çıkarmak
 
-`bot.py` içindeki `SOURCES` listesine `(kaynak adı, RSS url)` şeklinde satır
+`bot.py` içindeki `SOURCES` listesine `(kaynak adı, RSS url, zorunlu kategori veya None)` şeklinde satır
 ekleyip repo'ya push etmek yeterli.
 
 ## Sıklığı değiştirmek
@@ -33,3 +33,12 @@ bu kotayı hızla tüketip botu durdurabilir.
 
 Bot token'ı kod içinde değil, GitHub repo secret'ı olan `TELEGRAM_BOT_TOKEN`
 içinde tutulur (Settings → Secrets and variables → Actions).
+## Kart tasarımı ve görseller
+
+- Kart: üstte net haber fotoğrafı (efektsiz), altta koyu panel; başlık, kategori, kaynak ve
+  sol üstte `assets/logo.png` (G360 logosu). Fotoğraf yoksa logolu kategori renkli kart üretilir.
+- Görsel seçimi: makalenin `og:image` adresi ve RSS görseli indirilir, en büyük olan kullanılır;
+  500px altı küçük resimler (thumbnail) kullanılmaz.
+- Spor: 9 farklı kaynak, her çalışmada en fazla 4 spor haberi (`MAX_SPORTS_PER_RUN`).
+- Aynı haber farklı kaynaklardan gelirse başlık benzerliğiyle tekrar paylaşılmaz.
+- 24 saatten eski haberler paylaşılmaz. "SON DAKİKA" sadece 3 saatten yeni haberlere verilir.
